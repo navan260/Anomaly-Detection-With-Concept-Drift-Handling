@@ -1,0 +1,86 @@
+# =============================================================================
+#  Drift-Adaptive Streaming Anomaly Detection — hyperparameter configuration
+# =============================================================================
+#  Every tunable number in the project lives here.
+#  - Edit a value, save, then press "R" (Rerun) in the Streamlit app.
+#  - Sidebar sliders start at these values; moving a slider overrides the value
+#    for that session only (this file is never modified by the app).
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Warm-up / cold start
+# -----------------------------------------------------------------------------
+[warmup]
+samples_long_stream  = 200    # N0 for streams with > 1000 rows (NAB)
+samples_short_stream = 20     # N0 for small streams (normal.csv / anomaly.csv)
+min_samples          = 5      # hard lower bound on N0
+
+
+# -----------------------------------------------------------------------------
+# Half-Space Trees (streaming anomaly scorer)
+# -----------------------------------------------------------------------------
+[hst]
+n_trees     = 25     # number of trees in the ensemble
+height      = 8      # depth of each tree
+window_size = 25     # reference/latest window length (samples)
+seed        = 42
+
+
+# -----------------------------------------------------------------------------
+# Composite anomaly score  =  hst_weight * HST  +  (1 - hst_weight) * z_score_term
+#   z_score_term = 1 - exp(-z_decay * |x - baseline_mean| / baseline_std)
+# -----------------------------------------------------------------------------
+[score]
+hst_weight          = 0.45   # 0 = pure z-deviation, 1 = pure HST
+z_decay             = 0.35   # larger = score saturates faster for big deviations
+min_values_for_z    = 5      # readings needed before the z-term is used
+
+
+# -----------------------------------------------------------------------------
+# Adaptive threshold   thr = mean(scores) + k_sigma * std(scores)
+# -----------------------------------------------------------------------------
+[threshold]
+k_sigma             = 3.0    # threshold multiplier (higher = fewer alarms)
+min_threshold       = 0.20   # threshold is clipped to [min, max]
+max_threshold       = 0.95
+init_score_std_floor = 0.015 # std floor when setting the first threshold
+score_std_floor     = 0.02   # std floor when updating the threshold
+score_window_min    = 50     # score history length = max(this, 2 * hst.window_size)
+value_window_min    = 30     # value history length = max(this, hst.window_size)
+baseline_ema_alpha  = 0.10   # how fast the baseline mean tracks normal readings
+baseline_std_floor  = 0.015
+post_drift_min_scores = 8    # min recent scores used to re-set threshold after drift
+
+
+# -----------------------------------------------------------------------------
+# ADWIN drift detector
+# -----------------------------------------------------------------------------
+[adwin]
+delta       = 0.002   # confidence; smaller = stricter (fewer drift detections)
+min_window  = 10      # readings before ADWIN starts testing (also >= warmup/2)
+max_window  = 400     # maximum readings kept in the adaptive window
+adaptive    = true    # false = never adapt (ablation: plain HST)
+
+
+# -----------------------------------------------------------------------------
+# Static offline baselines (fitted once on the warm-up window, then frozen)
+# -----------------------------------------------------------------------------
+[baselines]
+contamination        = 0.05   # expected anomaly fraction (IF contamination / OCSVM nu)
+k_sigma              = 3.0    # threshold multiplier on warm-up scores
+z_weight             = 0.5    # weight of the z-deviation term in the baseline score
+iforest_n_estimators = 50
+ocsvm_kernel         = "rbf"
+ocsvm_gamma          = "scale"
+random_state         = 42
+
+
+# -----------------------------------------------------------------------------
+# Dashboard defaults (initial slider positions / options)
+# -----------------------------------------------------------------------------
+[dashboard]
+default_replay_samples = 7267     # rows replayed from long NAB streams
+adwin_delta_options    = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.05]
+drift_magnitude_sigma  = 1.5      # default injected drift (× stream σ)
+spike_magnitude_sigma  = 6.0      # default injected point fault (× stream σ)
