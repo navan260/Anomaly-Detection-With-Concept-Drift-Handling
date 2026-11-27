@@ -43,7 +43,7 @@ min_values_for_z    = 5      # readings needed before the z-term is used
 [threshold]
 k_sigma             = 3.0    # threshold multiplier (higher = fewer alarms)
 min_threshold       = 0.20   # threshold is clipped to [min, max]
-max_threshold       = 0.95
+max_threshold       = 0.88
 init_score_std_floor = 0.015 # std floor when setting the first threshold
 score_std_floor     = 0.02   # std floor when updating the threshold
 score_window_min    = 50     # score history length = max(this, 2 * hst.window_size)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,32 +19,16 @@ except ImportError:  # running detector.py directly
 # Optional River integration if installed in the environment
 try:
     from river import anomaly as river_anomaly
-    from river import drift as river_drift
     HAS_RIVER = True
 except ImportError:
     HAS_RIVER = False
 
 
-class _FallbackHalfSpaceNode:
-    """Single node in a Half-Space Tree."""
-    __slots__ = ("feature", "split_val", "left", "right", "r", "l")
-
-    def __init__(self, feature: Optional[str] = None, split_val: float = 0.0,
-                 left: Optional[_FallbackHalfSpaceNode] = None,
-                 right: Optional[_FallbackHalfSpaceNode] = None):
-        self.feature = feature
-        self.split_val = split_val
-        self.left = left
-        self.right = right
-        self.r = 0  # Reference window mass
-        self.l = 0  # Latest window mass
-
-
 class NativeHalfSpaceTrees:
     """
     Exact implementation of Streaming Half-Space Trees (Tan, Ting & Liu, 2011)
-     matching River's HalfSpaceTrees API (`score_one`, `learn_one`).
-    Provides deterministic, constant-time O(1) and constant-memory scoring.
+    matching River's HalfSpaceTrees API (`score_one`, `learn_one`).
+    Uses compact flat arrays for deterministic O(1) time and low fixed memory.
     """
 
     def __init__(
@@ -60,91 +44,97 @@ class NativeHalfSpaceTrees:
         self.window_size = window_size
         self.limits = limits or {}
         self.rng = np.random.default_rng(seed)
-        self.trees: List[_FallbackHalfSpaceNode] = []
         self._samples_seen = 0
-        self._max_mass = window_size * (2 ** height)
+        self._max_mass = window_size * (1 << height)
+        self.features: List[str] = []
+        self.feat_idx: Optional[np.ndarray] = None
+        self.splits: Optional[np.ndarray] = None
+        self.r_leaf: Optional[np.ndarray] = None
+        self.l_leaf: Optional[np.ndarray] = None
+        self._tree_rows = np.arange(n_trees, dtype=np.int32)
 
-    def _build_tree(
-        self, features: List[str], work_ranges: Dict[str, Tuple[float, float]], depth: int
-    ) -> _FallbackHalfSpaceNode:
+    def _build_recursive(
+        self,
+        tree_idx: int,
+        node_idx: int,
+        n_feat: int,
+        work_ranges: List[Tuple[float, float]],
+        depth: int,
+    ) -> None:
         if depth >= self.height:
-            return _FallbackHalfSpaceNode()
-        feat = features[int(self.rng.integers(0, len(features)))]
-        low, high = work_ranges[feat]
-        split = (low + high) / 2.0
+            return
+        f_i = int(self.rng.integers(0, n_feat))
+        low, high = work_ranges[f_i]
+        mid = 0.5 * (low + high)
+        self.feat_idx[tree_idx, node_idx] = f_i
+        self.splits[tree_idx, node_idx] = mid
 
-        left_ranges = dict(work_ranges)
-        left_ranges[feat] = (low, split)
-        right_ranges = dict(work_ranges)
-        right_ranges[feat] = (split, high)
+        left_ranges = list(work_ranges)
+        left_ranges[f_i] = (low, mid)
+        right_ranges = list(work_ranges)
+        right_ranges[f_i] = (mid, high)
 
-        return _FallbackHalfSpaceNode(
-            feature=feat,
-            split_val=split,
-            left=self._build_tree(features, left_ranges, depth + 1),
-            right=self._build_tree(features, right_ranges, depth + 1),
-        )
+        self._build_recursive(tree_idx, 2 * node_idx + 1, n_feat, left_ranges, depth + 1)
+        self._build_recursive(tree_idx, 2 * node_idx + 2, n_feat, right_ranges, depth + 1)
 
     def _init_trees(self, x: Dict[str, float]) -> None:
-        features = list(x.keys())
-        work_ranges: Dict[str, Tuple[float, float]] = {}
-        for f, val in x.items():
+        self.features = list(x.keys())
+        n_feat = len(self.features)
+        work_ranges: List[Tuple[float, float]] = []
+        for f in self.features:
+            val = x[f]
             if f in self.limits:
-                work_ranges[f] = self.limits[f]
+                work_ranges.append(self.limits[f])
             else:
                 span = max(abs(val) * 2.0, 2.0)
                 q = float(self.rng.uniform(0.15, 0.85))
                 low = val - 2.0 * q * span
-                high = low + 2.0 * span
-                work_ranges[f] = (low, high)
-        self.trees = [
-            self._build_tree(features, dict(work_ranges), 0) for _ in range(self.n_trees)
-        ]
+                work_ranges.append((low, low + 2.0 * span))
+
+        n_internal = (1 << self.height) - 1
+        n_leaves = 1 << self.height
+        self.feat_idx = np.zeros((self.n_trees, n_internal), dtype=np.int8)
+        self.splits = np.zeros((self.n_trees, n_internal), dtype=np.float32)
+        self.r_leaf = np.zeros((self.n_trees, n_leaves), dtype=np.int32)
+        self.l_leaf = np.zeros((self.n_trees, n_leaves), dtype=np.int32)
+
+        for t in range(self.n_trees):
+            self._build_recursive(t, 0, n_feat, list(work_ranges), 0)
+
+    def _leaf_indices(self, x: Dict[str, float]) -> np.ndarray:
+        vals_arr = np.asarray([float(x.get(f, 0.0)) for f in self.features], dtype=np.float32)
+        n_internal = (1 << self.height) - 1
+        node = np.zeros(self.n_trees, dtype=np.int32)
+        for _ in range(self.height):
+            f_idx = self.feat_idx[self._tree_rows, node]
+            sp = self.splits[self._tree_rows, node]
+            node = 2 * node + 1 + (vals_arr[f_idx] >= sp)
+        return node - n_internal
 
     def score_one(self, x: Dict[str, float]) -> float:
         """Return an anomaly score in [0, 1] where higher = more anomalous."""
-        if not self.trees:
+        if self.feat_idx is None:
             return 0.5
-        total_mass_score = 0.0
-        for root in self.trees:
-            node = root
-            depth = 0
-            while node.left is not None and node.right is not None:
-                val = x.get(node.feature, 0.0)
-                node = node.left if val < node.split_val else node.right
-                depth += 1
-            mass = node.r if self._samples_seen >= self.window_size else node.l
-            total_mass_score += mass * (2 ** depth)
-
+        leaves = self._leaf_indices(x)
+        masses = (
+            self.r_leaf[self._tree_rows, leaves]
+            if self._samples_seen >= self.window_size
+            else self.l_leaf[self._tree_rows, leaves]
+        )
+        total_mass_score = float(masses.sum()) * (1 << self.height)
         avg_score = total_mass_score / (self.n_trees * max(self._max_mass, 1))
-        # Anomaly score is 1 - normalized mass (sparse regions have low mass -> high anomaly score)
         return float(np.clip(1.0 - avg_score, 0.0, 1.0))
 
     def learn_one(self, x: Dict[str, float]) -> None:
         """Update latest window mass and pivot windows every `window_size` readings."""
-        if not self.trees:
+        if self.feat_idx is None:
             self._init_trees(x)
-
-        for root in self.trees:
-            node = root
-            node.l += 1
-            while node.left is not None and node.right is not None:
-                val = x.get(node.feature, 0.0)
-                node = node.left if val < node.split_val else node.right
-                node.l += 1
-
+        leaves = self._leaf_indices(x)
+        self.l_leaf[self._tree_rows, leaves] += 1
         self._samples_seen += 1
         if self._samples_seen % self.window_size == 0:
-            for root in self.trees:
-                self._pivot_node(root)
-
-    def _pivot_node(self, node: Optional[_FallbackHalfSpaceNode]) -> None:
-        if node is None:
-            return
-        node.r = node.l
-        node.l = 0
-        self._pivot_node(node.left)
-        self._pivot_node(node.right)
+            self.r_leaf[:] = self.l_leaf
+            self.l_leaf.fill(0)
 
 
 class NativeADWIN:
@@ -173,18 +163,15 @@ class NativeADWIN:
         min_sub = max(3, self.min_window // 3)
         delta_prime = max(self.delta / math.log(max(n, 2)), 1e-9)
 
-        # Vectorised evaluation of every split point (older w0 | newer w1) using
-        # cumulative sums, so each update costs one O(n) numpy pass.
         csum = np.cumsum(arr)
         csq = np.cumsum(arr * arr)
-        n0 = np.arange(n - min_sub, min_sub - 1, -1)  # same order as scanning n1 upward
+        n0 = np.arange(n - min_sub, min_sub - 1, -1)
         n1 = n - n0
         s0, q0 = csum[n0 - 1], csq[n0 - 1]
         s1, q1 = csum[-1] - s0, csq[-1] - q0
         mu0, mu1 = s0 / n0, s1 / n1
         var0 = np.maximum(q0 / n0 - mu0 ** 2, 0.0)
         var1 = np.maximum(q1 / n1 - mu1 ** 2, 0.0)
-        # Pooled within-subwindow variance (prevents the step jump itself from inflating variance)
         pooled_var = np.maximum((n0 * var0 + n1 * var1) / n, 1e-4)
         m_inv = 1.0 / n0 + 1.0 / n1
         epsilon = np.sqrt(2.0 * m_inv * pooled_var * math.log(2.0 / delta_prime))
@@ -194,7 +181,6 @@ class NativeADWIN:
             cut = int(n0[hits[0]])
             self.change_detected = True
             self.n_detections += 1
-            # Drop older sub-window w0 so window now holds only the new regime w1
             for _ in range(cut):
                 self.window.popleft()
 
@@ -221,8 +207,8 @@ class OnlineAnomalySystem:
     Implements prequential evaluation (test-then-train):
     1. Score incoming reading using Half-Space Trees + rolling feature statistics.
     2. Compare score against adaptive threshold (established after warm-up).
-    3. Feed baseline dynamics to ADWIN; if drift is signaled, adapt the baseline
-       and threshold without offline retraining.
+    3. Feed non-transient stream dynamics to ADWIN; when sustained drift is
+       signaled, adapt the baseline and threshold without offline retraining.
     4. Update the streaming model (`learn_one`).
     """
 
@@ -234,10 +220,6 @@ class OnlineAnomalySystem:
         adaptive: Optional[bool] = None,
         cfg: Optional[Dict[str, Any]] = None,
     ):
-        """
-        All hyperparameters come from `config.toml` (or the `cfg` dict passed in).
-        The explicit keyword arguments, when given, override the config values.
-        """
         cfg = cfg if cfg is not None else load_config()
         w, h, s, t, a = cfg["warmup"], cfg["hst"], cfg["score"], cfg["threshold"], cfg["adwin"]
 
@@ -247,7 +229,6 @@ class OnlineAnomalySystem:
         self.adaptive = bool(adaptive if adaptive is not None else a["adaptive"])
         self.window_size = int(h["window_size"])
 
-        # Score / threshold constants
         self.hst_weight = float(s["hst_weight"])
         self.z_decay = float(s["z_decay"])
         self.min_values_for_z = int(s["min_values_for_z"])
@@ -259,41 +240,52 @@ class OnlineAnomalySystem:
         self.baseline_std_floor = float(t["baseline_std_floor"])
         self.post_drift_min_scores = int(t["post_drift_min_scores"])
 
-        # Initialize HST scorer (River if installed, otherwise NativeHST)
         hst_kwargs = dict(
-            n_trees=int(h["n_trees"]), height=int(h["height"]),
-            window_size=self.window_size, seed=int(h["seed"]),
+            n_trees=int(h["n_trees"]),
+            height=int(h["height"]),
+            window_size=self.window_size,
+            seed=int(h["seed"]),
         )
         if HAS_RIVER and hasattr(river_anomaly, "HalfSpaceTrees"):
             self.hst = river_anomaly.HalfSpaceTrees(**hst_kwargs)
         else:
             self.hst = NativeHalfSpaceTrees(**hst_kwargs)
 
+        max_w = max(int(a["max_window"]), self.warmup)
+        min_w = max(int(a["min_window"]), min(self.warmup, 120) if self.warmup >= 100 else self.warmup // 2)
         self.adwin = NativeADWIN(
             delta=self.adwin_delta,
-            min_window=max(int(a["min_window"]), self.warmup // 2),
-            max_window=int(a["max_window"]),
+            min_window=min_w,
+            max_window=max_w,
         )
 
         self.init_scores: List[float] = []
+        self.init_values: List[float] = []
         self.score_window: deque[float] = deque(maxlen=max(int(t["score_window_min"]), self.window_size * 2))
         self.value_window: deque[float] = deque(maxlen=max(int(t["value_window_min"]), self.window_size))
+        self.regime_window: deque[float] = deque(maxlen=max_w)
 
         self.baseline_mean: float = 0.0
         self.baseline_std: float = 1.0
         self.threshold: Optional[float] = None
+        self._warmup_threshold: Optional[float] = None
         self.step_count: int = 0
+        self._alarm_streak: List[float] = []
+        self._streak_limit: int = 5
 
     def _compute_composite_score(self, val: float, hst_raw: float) -> float:
-        """
-        Combine HST subspace mass score with local rolling z-deviation so point
-        anomalies and regime changes produce interpretable, well-scaled scores.
-        """
         if len(self.value_window) >= self.min_values_for_z:
             z_dev = abs(val - self.baseline_mean) / max(self.baseline_std, 1e-4)
             z_norm = 1.0 - math.exp(-self.z_decay * z_dev)
             return float(self.hst_weight * hst_raw + (1.0 - self.hst_weight) * z_norm)
         return float(hst_raw)
+
+    def _effective_std(self) -> float:
+        local_std = float(np.std(self.value_window)) if len(self.value_window) >= 2 else self.baseline_std
+        if len(self.regime_window) >= 10:
+            regime_std = float(np.std(self.regime_window))
+            return max(local_std, 0.55 * regime_std, self.baseline_std_floor)
+        return max(local_std, self.baseline_std_floor)
 
     def _update_threshold(self, scores: List[float]) -> None:
         mu_s = float(np.mean(scores))
@@ -301,26 +293,41 @@ class OnlineAnomalySystem:
         self.threshold = float(np.clip(mu_s + self.k * sd_s, self.thr_min, self.thr_max))
 
     def _set_initial_threshold(self) -> None:
-        arr = np.array(self.init_scores, dtype=float)
-        mu = float(arr.mean())
-        sigma = max(float(arr.std()), self.init_std_floor)
-        self.threshold = float(mu + self.k * sigma)
-
-        val_arr = np.array(self.value_window, dtype=float)
+        val_arr = np.array(self.init_values, dtype=float)
         if len(val_arr) > 0:
             self.baseline_mean = float(val_arr.mean())
             self.baseline_std = max(float(val_arr.std()), self.baseline_std_floor)
+            for v in val_arr:
+                self.adwin.window.append(float(v))
+                self.regime_window.append(float(v))
+
+        # Calibrate initial threshold on the warm-up readings using the warm-up-fitted HST & baseline
+        # (same protocol as StaticBaselineDetector, avoiding empty-tree cold-start score inflation)
+        calibrated_scores: List[float] = []
+        prev = float(val_arr[0]) if len(val_arr) else 0.0
+        for v in val_arr:
+            fv = float(v)
+            hs = float(self.hst.score_one({"value": fv, "roc": fv - prev}))
+            calibrated_scores.append(self._compute_composite_score(fv, hs))
+            prev = fv
+
+        arr = np.array(calibrated_scores, dtype=float)
+        mu = float(arr.mean())
+        sigma = max(float(arr.std()), self.init_std_floor)
+        self.threshold = float(np.clip(mu + self.k * sigma, self.thr_min, self.thr_max))
+        self._warmup_threshold = self.threshold
+        self.score_window.clear()
+        self.score_window.extend(calibrated_scores[-self.score_window.maxlen :])
 
     def step(self, x: Dict[str, float], timestamp: str | float | None = None) -> dict:
-        """
-        Process a single sensor observation `x` (e.g. `{'value': 0.12}`) in one pass.
-        Returns a dictionary containing `score`, `threshold`, `alarm`, `drift`,
-        `warmup`, and `latency_ms`.
-        """
         t0 = time.perf_counter()
         val = float(x.get("value", next(iter(x.values()))))
 
-        # Rate of change feature for context
+        if self.threshold is None and len(self.value_window) > 0:
+            val_arr = np.array(self.value_window, dtype=float)
+            self.baseline_mean = float(val_arr.mean())
+            self.baseline_std = max(float(val_arr.std()), self.baseline_std_floor)
+
         prev_val = self.value_window[-1] if self.value_window else val
         features = {"value": val, "roc": val - prev_val}
 
@@ -331,6 +338,7 @@ class OnlineAnomalySystem:
         # 2. Warm-up handling
         if self.threshold is None:
             self.value_window.append(val)
+            self.init_values.append(val)
             self.init_scores.append(score)
             self.score_window.append(score)
             self.hst.learn_one(features)
@@ -348,35 +356,53 @@ class OnlineAnomalySystem:
                 "baseline_mean": self.baseline_mean,
             }
 
-        # 3. Alarm comparison against active threshold
+        # 3. Prequential alarm decision against active threshold (never retroactively erased)
         alarm = bool(score > self.threshold)
+        drift = False
 
-        # 4. Drift monitoring (ADWIN watches stream statistics)
-        drift = self.adwin.update(val)
+        # Winsorized long-window variance tracker prevents brief quiet spells from collapsing std
+        if self.adaptive:
+            clipped = float(
+                np.clip(
+                    val,
+                    self.baseline_mean - 4.5 * self.baseline_std,
+                    self.baseline_mean + 4.5 * self.baseline_std,
+                )
+            )
+            self.regime_window.append(clipped)
+
+        # 4. Gate ADWIN on isolated spikes; flush if a shift persists >= _streak_limit steps
+        if not alarm:
+            self._alarm_streak.clear()
+            drift = self.adwin.update(val)
+        else:
+            self._alarm_streak.append(val)
+            if len(self._alarm_streak) >= self._streak_limit:
+                for sv in self._alarm_streak:
+                    if self.adwin.update(sv):
+                        drift = True
+                self._alarm_streak.clear()
 
         if drift and self.adaptive:
-            # Re-anchor baseline and threshold to the post-drift window inside ADWIN
             recent_vals = list(self.adwin.window)
             if len(recent_vals) >= 3:
                 self.baseline_mean = float(np.mean(recent_vals))
-                self.baseline_std = max(float(np.std(recent_vals)), self.baseline_std_floor)
                 self.value_window.clear()
                 self.value_window.extend(recent_vals)
-            # Re-evaluate score against the newly adapted regime
-            score = self._compute_composite_score(val, hst_score)
-            self.score_window.append(score)
+                self.baseline_std = self._effective_std()
+            adapted_score = self._compute_composite_score(val, hst_score)
+            self.score_window.append(adapted_score)
             recent_scores = list(self.score_window)[-max(self.post_drift_min_scores, len(recent_vals)):]
             if recent_scores:
                 self._update_threshold(recent_scores)
-            alarm = bool(score > self.threshold)
 
-        # 5. Train (Learn) - update baseline statistics
-        self.value_window.append(val)
+        # 5. Train (Learn) - update baseline statistics from ADWIN's active regime window
         if not alarm:
+            self.value_window.append(val)
             self.score_window.append(score)
-            if self.adaptive and len(self.value_window) >= self.min_values_for_z:
-                self.baseline_mean = (1.0 - self.ema_alpha) * self.baseline_mean + self.ema_alpha * val
-                self.baseline_std = max(float(np.std(self.value_window)), self.baseline_std_floor)
+            if self.adaptive and len(self.adwin.window) >= self.min_values_for_z:
+                self.baseline_mean = float(np.mean(self.adwin.window))
+                self.baseline_std = self._effective_std()
                 self._update_threshold(list(self.score_window))
 
         self.hst.learn_one(features)
@@ -471,22 +497,49 @@ class StaticBaselineDetector:
             "latency_ms": (time.perf_counter() - t0) * 1000.0,
         }
 
-    def run_stream(self, values: np.ndarray) -> Tuple[np.ndarray, float]:
-        """
-        Process a whole stream. Because the static model is frozen after warm-up,
-        scoring all post-warm-up readings in a single batch gives exactly the same
-        alarms as calling `step` row by row, but is much faster.
+    def _measure_single_step_latency_ms(self, post_warmup_values: np.ndarray) -> float:
+        """Measure true one-sample-at-a-time streaming inference latency (`step()`)."""
+        if not self.fitted or len(post_warmup_values) == 0:
+            return 0.0
+        probe = post_warmup_values[: min(80, len(post_warmup_values))]
+        t0 = time.perf_counter()
+        for v in probe:
+            self.step({"value": float(v)})
+        return (time.perf_counter() - t0) * 1000.0 / len(probe)
 
-        Returns (alarms array, mean latency per sample in ms).
-        """
+    def run_stream(self, values: np.ndarray) -> Tuple[np.ndarray, float]:
         values = np.asarray(values, dtype=float)
         alarms = np.zeros(len(values), dtype=int)
-        t0 = time.perf_counter()
         for v in values[: self.warmup]:
             self.step({"value": float(v)})
         rest = values[self.warmup:]
         if len(rest) and self.fitted:
             scores = self._raw_score(rest.reshape(-1, 1))
             alarms[self.warmup:] = (scores > self.threshold).astype(int)
-        mean_latency = (time.perf_counter() - t0) * 1000.0 / max(len(values), 1)
+        mean_latency = self._measure_single_step_latency_ms(rest)
         return alarms, mean_latency
+
+    def run_stream_detailed(self, values: np.ndarray) -> Dict[str, Any]:
+        """Return full per-step scores, alarms, frozen baseline, and true streaming latency."""
+        values = np.asarray(values, dtype=float)
+        n = len(values)
+        alarms = np.zeros(n, dtype=bool)
+        scores = np.zeros(n, dtype=float)
+        w_end = min(self.warmup, n)
+        for i in range(w_end):
+            self.step({"value": float(values[i])})
+        if self.fitted and w_end > 0:
+            scores[:w_end] = self._raw_score(values[:w_end].reshape(-1, 1))
+        rest = values[w_end:]
+        if len(rest) and self.fitted:
+            rest_scores = self._raw_score(rest.reshape(-1, 1))
+            scores[w_end:] = rest_scores
+            alarms[w_end:] = rest_scores > self.threshold
+        mean_latency = self._measure_single_step_latency_ms(rest)
+        return {
+            "alarms": alarms,
+            "scores": scores,
+            "threshold": float(self.threshold),
+            "baseline_mean": float(self.mu0),
+            "mean_latency_ms": mean_latency,
+        }
