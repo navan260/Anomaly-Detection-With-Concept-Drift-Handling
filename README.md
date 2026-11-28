@@ -60,25 +60,65 @@ Anomaly-Detection-With-Concept-Drift-Handling/
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
-### 1. Install Dependencies
-```powershell
+```bash
+# 1. Install dependencies
 python -m pip install -r requirements.txt
 ```
-The detector includes native Half-Space Trees, ADWIN, Page-Hinkley, and KSWIN implementations, so River and a Rust compiler are not required.
+The detector includes a native Half-Space Trees and ADWIN implementation, so
+River and a Rust compiler are not required.
 
-### 2. Launch the Interactive Streamlit Dashboard
+### 2. Launch the Formal Streamlit UI
 ```powershell
 streamlit run src/dashboard.py
-```
 
-### 3. Run the Reproducible CLI Benchmark Table
-```powershell
-python scripts/run_benchmark.py
-```
-
-### 4. Run the Automated Verification Suite
+### 3. Run the Automated Verification Suite
 ```powershell
 pytest tests/test_detector.py -v
 ```
+
+### Python Streaming API
+```python
+from src.detector import OnlineAnomalySystem
+
+detector = OnlineAnomalySystem(warmup=50, k_sigma=3.0, adwin_delta=0.002)
+
+for reading in sensor_stream:
+    res = detector.step({"value": reading})
+    if res["alarm"]:
+        print(f"🚨 Fault! score={res['score']:.3f} > thr={res['threshold']:.3f}")
+```
+
+---
+
+## 🗂️ Project Structure
+
+```text
+├── assets/                # Animated SVG banner & benchmark plots
+├── config.toml            # Hot-reloadable hyperparameters (HST, ADWIN, thresholds)
+├── data/nab/              # Processed Numenta Anomaly Benchmark streams
+├── scripts/prepare_nab.py # Converts raw NAB files + official anomaly windows
+├── src/detector.py        # NativeHalfSpaceTrees, NativeADWIN & baselines
+├── src/dashboard.py       # Interactive Streamlit replay, comparison & drift injector
+└── tests/                 # Verification suite (normal, spike, and step-drift tests)
+```
+
+<details>
+<summary><b>📚 References &amp; Dataset Licence</b></summary>
+
+- **HST:** Tan, Ting & Liu (2011), *Fast anomaly detection for streaming data*, IJCAI.
+- **ADWIN:** Bifet & Gavaldà (2007), *Learning from time-changing data with adaptive windowing*, SIAM SDM.
+- **NAB:** Ahmad et al. (2017), *Unsupervised real-time anomaly detection for streaming data*, Neurocomputing ([Numenta/NAB](https://github.com/numenta/NAB), AGPL-3.0).
+- **Benchmark & Drift:** Cao et al. (2025), *AI Review*; Gama et al. (2014), *ACM Computing Surveys*.
+
+</details>
+
+---
+
+<div align="center">
+
+**AIML Lab (`IS353IA`) — Experiential Learning** • **RV College of Engineering®, Dept. of CSE**  
+**Team:** Mohith S D Gowda (`1RV24CS158`) · Navaneeth V (`1RV24CS165`) &nbsp;|&nbsp; **Guide:** Dr. Veena Gadad
+
+</div>
