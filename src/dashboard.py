@@ -5,7 +5,6 @@ Run with: streamlit run src/dashboard.py
 from __future__ import annotations
 
 import importlib
-import pickle
 import sys
 import time
 from pathlib import Path
@@ -24,7 +23,11 @@ if str(ROOT_DIR) not in sys.path:
 import src.detector as _detector_mod
 importlib.reload(_detector_mod)
 from src.config import load_config
-from src.detector import OnlineAnomalySystem, StaticBaselineDetector
+from src.detector import (
+    OnlineAnomalySystem,
+    StaticBaselineDetector,
+    evaluate_predictions,
+)
 
 CFG = load_config()
 
@@ -44,7 +47,7 @@ st.markdown(
         .block-container {
             padding-top: 2.2rem;
             padding-bottom: 3rem;
-            max-width: 1140px;
+            max-width: 1180px;
         }
         h1, h2, h3 {
             font-family: "Inter", "Segoe UI", system-ui, sans-serif;
@@ -70,7 +73,7 @@ st.markdown(
             background-color: #FFFFFF;
             border: 1px solid #E2E8F0;
             border-radius: 10px;
-            padding: 1rem 1.25rem;
+            padding: 0.95rem 1.15rem;
         }
         button[data-baseweb="tab"] {
             font-size: 0.95rem !important;
@@ -90,6 +93,12 @@ NAB_STREAMS = {
     "NAB: Ambient Temperature (7,267 pts)": ("ambient_temperature_system_failure.csv", "°F"),
     "NAB: Machine Temperature (22,695 pts)": ("machine_temperature_system_failure.csv", "°F"),
     "NAB: CPU Utilization (18,050 pts)": ("cpu_utilization_asg_misconfiguration.csv", "%"),
+}
+
+DRIFT_METHOD_LABELS = {
+    "ADWIN (Adaptive Windowing)": "adwin",
+    "Page-Hinkley (Sequential CUSUM)": "page_hinkley",
+    "KSWIN (Kolmogorov-Smirnov)": "kswin",
 }
 
 SCENARIOS: Dict[str, Dict[str, Any]] = {
@@ -252,7 +261,7 @@ def contiguous_spans(mask: np.ndarray, steps: np.ndarray) -> List[Tuple[int, int
 
 
 # ---------------------------------------------------------------------------
-# Prequential Evaluation
+# Prequential Evaluation & Multi-Detector Benchmark
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner="Processing sensor stream...")
 def run_evaluation(
@@ -260,22 +269,22 @@ def run_evaluation(
     warmup: int,
     k_sigma: float,
     adwin_delta: float,
+    drift_method: str,
     cfg: dict,
-    _engine_version: int = 6,
+    _engine_version: int = 8,
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
     values = df["value"].astype(float).to_numpy()
     timestamps = df["timestamp"].to_numpy()
     y_true = df["label"].astype(int).to_numpy()
 
     adaptive_sys = OnlineAnomalySystem(
-        warmup=warmup, k_sigma=k_sigma, adwin_delta=adwin_delta, adaptive=True, cfg=cfg
+        warmup=warmup,
+        k_sigma=k_sigma,
+        adwin_delta=adwin_delta,
+        adaptive=True,
+        drift_method=drift_method,
+        cfg=cfg,
     )
-    plain_hst = OnlineAnomalySystem(
-        warmup=warmup, k_sigma=k_sigma, adwin_delta=adwin_delta, adaptive=False, cfg=cfg
-    )
-    iforest_base = StaticBaselineDetector(method="iforest", warmup=warmup, cfg=cfg)
-    ocsvm_base = StaticBaselineDetector(method="ocsvm", warmup=warmup, cfg=cfg)
-
     records: List[dict] = []
     for idx, (val, ts, lbl) in enumerate(zip(values, timestamps, y_true)):
         res = adaptive_sys.step({"value": float(val)}, timestamp=ts)
@@ -286,8 +295,11 @@ def run_evaluation(
                 "value": float(val),
                 "label": int(lbl),
                 "score": round(res["score"], 4),
+                "hst_score": round(res.get("hst_score", res["score"]), 4),
+                "z_score": round(res.get("z_score", 0.0), 4),
                 "threshold": round(res["threshold"], 4),
                 "baseline_mean": round(res["baseline_mean"], 4),
+                "baseline_std": round(res.get("baseline_std", 1.0), 4),
                 "alarm": bool(res["alarm"]),
                 "drift": bool(res["drift"]),
                 "warmup": bool(res["warmup"]),
@@ -296,74 +308,97 @@ def run_evaluation(
         )
     res_df = pd.DataFrame(records)
 
-    t0 = time.perf_counter()
-    hst_alarms = np.array([int(plain_hst.step({"value": float(v)})["alarm"]) for v in values])
-    hst_lat = (time.perf_counter() - t0) * 1000.0 / max(len(values), 1)
+    def _run_online_variant(method_name: str, is_adaptive: bool) -> Tuple[np.ndarray, float, OnlineAnomalySystem]:
+        if method_name == drift_method and is_adaptive:
+            return (
+                res_df["alarm"].to_numpy(dtype=bool),
+                float(res_df["latency_ms"].mean()),
+                adaptive_sys,
+            )
+        det = OnlineAnomalySystem(
+            warmup=warmup,
+            k_sigma=k_sigma,
+            adwin_delta=adwin_delta,
+            adaptive=is_adaptive,
+            drift_method=method_name,
+            cfg=cfg,
+        )
+        t0 = time.perf_counter()
+        alarms = np.array([bool(det.step({"value": float(v)})["alarm"]) for v in values], dtype=bool)
+        lat = (time.perf_counter() - t0) * 1000.0 / max(len(values), 1)
+        return alarms, lat, det
 
+    adwin_alarms, adwin_lat, adwin_det = _run_online_variant("adwin", True)
+    ph_alarms, ph_lat, ph_det = _run_online_variant("page_hinkley", True)
+    ks_alarms, ks_lat, ks_det = _run_online_variant("kswin", True)
+    hst_alarms, hst_lat, plain_hst = _run_online_variant("none", False)
+
+    iforest_base = StaticBaselineDetector(method="iforest", warmup=warmup, cfg=cfg)
+    ocsvm_base = StaticBaselineDetector(method="ocsvm", warmup=warmup, cfg=cfg)
     if_detail = iforest_base.run_stream_detailed(values)
     oc_alarms, oc_lat = ocsvm_base.run_stream(values)
 
     res_df["static_if_alarm"] = if_detail["alarms"]
     res_df["static_if_mean"] = round(if_detail["baseline_mean"], 4)
 
-    def state_kb(model) -> float:
-        try:
-            return round(len(pickle.dumps(model)) / 1024.0, 1)
-        except Exception:
-            return float("nan")
-
-    def summarize(preds: np.ndarray, latency_ms: float, model) -> Dict[str, Any]:
-        """
-        Compute Window-Adjusted Precision/Recall/F1 (standard streaming benchmark
-        protocol for multi-step NAB windows; identical to point-wise F1 on single spikes).
-        """
-        preds_b = preds.astype(bool)
-        y_b = y_true.astype(bool)
-        windows = contiguous_spans(y_b, np.arange(len(y_b)))
-
-        adj_preds = preds_b.copy()
-        events_caught = 0
-        for s0, s1 in windows:
-            if preds_b[s0 : s1 + 1].any():
-                adj_preds[s0 : s1 + 1] = True
-                events_caught += 1
-
-        tp = int(np.sum(adj_preds & y_b))
-        fp = int(np.sum(adj_preds & ~y_b))
-        fn = int(np.sum(~adj_preds & y_b))
-        has_pos = len(windows) > 0
-        prec = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if not has_pos and fp == 0 else 0.0)
-        rec = tp / (tp + fn) if (tp + fn) > 0 else (1.0 if not has_pos else 0.0)
-        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
-
-        return {
-            "Faults Caught": f"{events_caught} / {len(windows)}" if has_pos else "—",
-            "False Alarms": fp,
-            "Precision": round(prec, 3),
-            "Recall": round(rec, 3),
-            "F1 Score": round(f1, 3),
-            "Latency (ms)": round(float(latency_ms), 3),
-            "Memory (KB)": state_kb(model),
-        }
-
     comparison = {
-        "HST + ADWIN (Adaptive)": summarize(
-            res_df["alarm"].to_numpy(), res_df["latency_ms"].mean(), adaptive_sys
+        "HST + ADWIN (Adaptive)": evaluate_predictions(adwin_alarms, y_true, adwin_lat, adwin_det),
+        "HST + Page-Hinkley (Adaptive)": evaluate_predictions(ph_alarms, y_true, ph_lat, ph_det),
+        "HST + KSWIN (Adaptive)": evaluate_predictions(ks_alarms, y_true, ks_lat, ks_det),
+        "Plain HST (No Drift Adapt)": evaluate_predictions(hst_alarms, y_true, hst_lat, plain_hst),
+        "Static Isolation Forest": evaluate_predictions(
+            if_detail["alarms"], y_true, if_detail["mean_latency_ms"], iforest_base
         ),
-        "Plain HST (No Drift Adapt)": summarize(hst_alarms, hst_lat, plain_hst),
-        "Static Isolation Forest": summarize(
-            if_detail["alarms"], if_detail["mean_latency_ms"], iforest_base
-        ),
-        "Static One-Class SVM": summarize(oc_alarms, oc_lat, ocsvm_base),
+        "Static One-Class SVM": evaluate_predictions(oc_alarms, y_true, oc_lat, ocsvm_base),
     }
     return res_df, comparison
+
+
+@st.cache_data(show_spinner="Running sensitivity sweep...")
+def run_sensitivity_sweep(
+    df: pd.DataFrame,
+    warmup: int,
+    adwin_delta: float,
+    drift_method: str,
+    cfg: dict,
+    _engine_version: int = 8,
+) -> pd.DataFrame:
+    values = df["value"].astype(float).to_numpy()
+    y_true = df["label"].astype(int).to_numpy()
+    k_grid = [2.0, 2.5, 2.75, 3.0, 3.5, 4.0, 4.5]
+    rows: List[Dict[str, Any]] = []
+    for k_val in k_grid:
+        det = OnlineAnomalySystem(
+            warmup=warmup,
+            k_sigma=k_val,
+            adwin_delta=adwin_delta,
+            adaptive=True,
+            drift_method=drift_method,
+            cfg=cfg,
+        )
+        t0 = time.perf_counter()
+        preds = np.array([bool(det.step({"value": float(v)})["alarm"]) for v in values], dtype=bool)
+        lat = (time.perf_counter() - t0) * 1000.0 / max(len(values), 1)
+        m = evaluate_predictions(preds, y_true, lat, det)
+        rows.append(
+            {
+                "k_sigma": k_val,
+                "F1 Score": m["F1 Score"],
+                "NAB Score": m["NAB Score"],
+                "False Alarms": m["False Alarms"],
+                "FA / 1k pts": m["FA / 1k pts"],
+                "Faults Caught": m["Faults Caught"],
+                "Mean Delay (steps)": m["Mean Delay (steps)"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
 # Clean Single-Purpose Chart Builders
 # ---------------------------------------------------------------------------
 def build_single_stream_chart(view_df: pd.DataFrame, warmup_pts: int, unit: str) -> go.Figure:
-    """Spacious, uncluttered chart for Tab 1 — shows only the sensor stream and adaptive behavior."""
+    """Spacious, uncluttered chart for Tab 1 — shows the sensor stream, ±2σ adaptive envelope, and alarms."""
     fig = go.Figure()
     if len(view_df) == 0:
         return fig
@@ -396,6 +431,33 @@ def build_single_stream_chart(view_df: pd.DataFrame, warmup_pts: int, unit: str)
                 layer="below",
                 line_width=0,
             )
+
+    # Adaptive ±2σ normal confidence envelope
+    if len(post_warmup) and "baseline_std" in post_warmup.columns:
+        upper = post_warmup["baseline_mean"] + 2.0 * post_warmup["baseline_std"]
+        lower = post_warmup["baseline_mean"] - 2.0 * post_warmup["baseline_std"]
+        fig.add_trace(
+            go.Scatter(
+                x=post_warmup["step"],
+                y=upper,
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=post_warmup["step"],
+                y=lower,
+                mode="lines",
+                fill="tonexty",
+                fillcolor="rgba(16, 185, 129, 0.11)",
+                line=dict(width=0),
+                name="Adaptive ±2σ Band",
+                hoverinfo="skip",
+            )
+        )
 
     # Sensor stream
     fig.add_trace(
@@ -462,7 +524,7 @@ def build_single_stream_chart(view_df: pd.DataFrame, warmup_pts: int, unit: str)
                 x=[None],
                 y=[None],
                 mode="lines",
-                name="Drift Adapted (ADWIN)",
+                name="Drift Adapted",
                 line=dict(color="#0D9488", width=2, dash="dot"),
             )
         )
@@ -489,7 +551,7 @@ def build_static_vs_adaptive_chart(view_df: pd.DataFrame, warmup_pts: int, unit:
         shared_xaxes=True,
         vertical_spacing=0.14,
         subplot_titles=(
-            "Adaptive Detector (HST + ADWIN) — Baseline Tracks Drift",
+            "Adaptive Detector (Streaming HST + Drift Monitor) — Baseline Tracks Drift",
             "Static Detector (Isolation Forest) — Frozen Baseline Causes False-Alarm Flood",
         ),
     )
@@ -558,19 +620,39 @@ def build_static_vs_adaptive_chart(view_df: pd.DataFrame, warmup_pts: int, unit:
     return fig
 
 
-def build_score_chart(view_df: pd.DataFrame, warmup_pts: int) -> go.Figure:
-    """Dedicated Anomaly Score vs. Threshold chart for Tab 3."""
+def build_score_chart(view_df: pd.DataFrame, warmup_pts: int, show_components: bool = False) -> go.Figure:
+    """Dedicated Anomaly Score vs. Threshold chart for Tab 3 (with optional HST/Z decomposition)."""
     fig = go.Figure()
     post_warmup = view_df[~view_df["warmup"]]
     w_end = int(view_df["step"].iloc[min(warmup_pts - 1, len(view_df) - 1)])
     fig.add_vrect(x0=0, x1=w_end, fillcolor="#F1F5F9", opacity=0.8, layer="below", line_width=0)
+
+    if show_components and "hst_score" in view_df.columns and "z_score" in view_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=view_df["step"],
+                y=view_df["hst_score"],
+                mode="lines",
+                name="HST Mass Component",
+                line=dict(color="#94A3B8", width=1.2, dash="dot"),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=view_df["step"],
+                y=view_df["z_score"],
+                mode="lines",
+                name="Z-Deviation Component",
+                line=dict(color="#8B5CF6", width=1.2, dash="dot"),
+            )
+        )
 
     fig.add_trace(
         go.Scatter(
             x=view_df["step"],
             y=view_df["score"],
             mode="lines",
-            name="Anomaly Score (sₜ)",
+            name="Composite Score (sₜ)",
             line=dict(color="#2563EB", width=1.9),
         )
     )
@@ -608,12 +690,61 @@ def build_score_chart(view_df: pd.DataFrame, warmup_pts: int) -> go.Figure:
     return fig
 
 
+def build_sensitivity_chart(sweep_df: pd.DataFrame) -> go.Figure:
+    """Dual-axis sensitivity curve showing F1 / NAB score vs. False Alarms across k_sigma."""
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(
+            x=sweep_df["k_sigma"],
+            y=sweep_df["F1 Score"],
+            mode="lines+markers",
+            name="Window-Adjusted F1",
+            line=dict(color="#16A34A", width=2.4),
+            marker=dict(size=8),
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=sweep_df["k_sigma"],
+            y=sweep_df["NAB Score"] / 100.0,
+            mode="lines+markers",
+            name="NAB Score (÷100)",
+            line=dict(color="#2563EB", width=2.0, dash="dash"),
+            marker=dict(size=7),
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=sweep_df["k_sigma"],
+            y=sweep_df["False Alarms"],
+            name="False Alarms",
+            marker_color="rgba(239, 68, 68, 0.28)",
+            width=0.16,
+        ),
+        secondary_y=True,
+    )
+    fig.update_layout(
+        height=300,
+        margin=dict(l=10, r=10, t=30, b=15),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        hovermode="x unified",
+        xaxis=dict(title="Threshold Multiplier (k_sigma)", showgrid=True, gridcolor="#F1F5F9"),
+    )
+    fig.update_yaxes(title_text="F1 / Normalized NAB [0–1]", range=[0, 1.05], showgrid=True, gridcolor="#F1F5F9", secondary_y=False)
+    fig.update_yaxes(title_text="False Alarms (count)", showgrid=False, secondary_y=True)
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Clean Header + Single Control Row
 # ---------------------------------------------------------------------------
 st.markdown("## Drift-Adaptive Streaming Anomaly Detection")
 st.markdown(
-    '<div class="app-subtitle">Online Half-Space Trees + ADWIN drift adaptation &nbsp;•&nbsp; AIML Lab (IS353IA), RVCE</div>',
+    '<div class="app-subtitle">Online Half-Space Trees + Drift Adaptation (ADWIN / Page-Hinkley / KSWIN) &nbsp;•&nbsp; AIML Lab (IS353IA), RVCE</div>',
     unsafe_allow_html=True,
 )
 
@@ -636,6 +767,13 @@ preset = SCENARIOS[selected_scenario]
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### Advanced Settings")
+    drift_label = st.selectbox(
+        "Drift Monitor Algorithm",
+        options=list(DRIFT_METHOD_LABELS.keys()),
+        index=0,
+    )
+    drift_method = DRIFT_METHOD_LABELS[drift_label]
+
     if selected_scenario == "Custom Dataset / Inject Drift":
         custom_choice = st.selectbox(
             "Dataset",
@@ -683,7 +821,7 @@ with st.sidebar:
     )
     delta_opts = sorted({float(d) for d in CFG["dashboard"]["adwin_delta_options"]} | {float(preset["adwin_delta"])})
     adwin_delta = st.select_slider(
-        "ADWIN Sensitivity (δ)",
+        "Drift Sensitivity (δ)",
         options=delta_opts,
         value=float(preset["adwin_delta"]),
         key=f"d_{selected_scenario}",
@@ -715,10 +853,21 @@ with st.sidebar:
 # Run Detector
 # ---------------------------------------------------------------------------
 results_df, model_comparison = run_evaluation(
-    stream_df, warmup=warmup_pts, k_sigma=k_sigma, adwin_delta=adwin_delta, cfg=CFG
+    stream_df,
+    warmup=warmup_pts,
+    k_sigma=k_sigma,
+    adwin_delta=adwin_delta,
+    drift_method=drift_method,
+    cfg=CFG,
 )
 
-adap_m = model_comparison["HST + ADWIN (Adaptive)"]
+active_key = {
+    "adwin": "HST + ADWIN (Adaptive)",
+    "page_hinkley": "HST + Page-Hinkley (Adaptive)",
+    "kswin": "HST + KSWIN (Adaptive)",
+}.get(drift_method, "HST + ADWIN (Adaptive)")
+
+adap_m = model_comparison[active_key]
 stat_m = model_comparison["Static Isolation Forest"]
 adap_fp = int(adap_m["False Alarms"])
 stat_fp = int(stat_m["False Alarms"])
@@ -733,14 +882,14 @@ caught_windows = sum(1 for (s0, s1) in gt_windows if bool(results_df.loc[s0:s1, 
 tab_stream, tab_compare, tab_details = st.tabs(
     [
         "Stream Detection",
-        "Adaptive vs. Static",
+        "Adaptive vs. Static & Ablations",
         "Scores & Event Log",
     ]
 )
 
 with tab_stream:
     st.write("")
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric(
         "Real Faults Caught",
         f"{caught_windows} / {len(gt_windows)}" if gt_windows else "0 Faults in Stream",
@@ -751,7 +900,14 @@ with tab_stream:
         delta=f"{adap_fp - stat_fp} vs Static ({stat_fp})" if stat_fp != adap_fp else None,
         delta_color="inverse",
     )
-    m3.metric("Drift Adaptations", f"{n_drifts}")
+    m3.metric(
+        "NAB Benchmark Score",
+        f"{adap_m['NAB Score']:.1f} / 100",
+        delta=f"+{adap_m['NAB Score'] - stat_m['NAB Score']:.1f} vs Static"
+        if adap_m["NAB Score"] != stat_m["NAB Score"]
+        else None,
+    )
+    m4.metric("Drift Adaptations", f"{n_drifts}")
 
     st.write("")
     chart_slot = st.empty()
@@ -770,8 +926,9 @@ with tab_stream:
         )
 
     st.markdown(
-        f'<div class="summary-line"><b>{selected_scenario}:</b> {preset["desc"]} '
-        f'Static Isolation Forest raised <b>{stat_fp}</b> false alarms vs. <b>{adap_fp}</b> with adaptive HST + ADWIN.</div>',
+        f'<div class="summary-line"><b>{selected_scenario} ({active_key}):</b> {preset["desc"]} '
+        f'Static Isolation Forest raised <b>{stat_fp}</b> false alarms (NAB: <b>{stat_m["NAB Score"]:.1f}</b>) vs. '
+        f'<b>{adap_fp}</b> false alarms (NAB: <b>{adap_m["NAB Score"]:.1f}</b>, F1: <b>{adap_m["F1 Score"]:.3f}</b>) with adaptive streaming detection.</div>',
         unsafe_allow_html=True,
     )
 
@@ -780,17 +937,38 @@ with tab_compare:
     st.plotly_chart(build_static_vs_adaptive_chart(results_df, warmup_pts, unit), width="stretch")
 
     st.write("")
-    st.markdown("#### Model Benchmark")
+    st.markdown("#### Multi-Detector & Drift-Adaptation Benchmark")
     comp_df = pd.DataFrame.from_dict(model_comparison, orient="index").reset_index().rename(columns={"index": "Detector"})
     st.dataframe(comp_df, width="stretch", hide_index=True)
 
+    with st.expander("Threshold Sensitivity & Ablation Analysis (k_sigma Sweep)", expanded=False):
+        sweep_df = run_sensitivity_sweep(
+            stream_df, warmup=warmup_pts, adwin_delta=adwin_delta, drift_method=drift_method, cfg=CFG
+        )
+        st.plotly_chart(build_sensitivity_chart(sweep_df), width="stretch")
+        st.dataframe(sweep_df, width="stretch", hide_index=True)
+
 with tab_details:
     st.write("")
-    st.markdown("#### Anomaly Score vs. Adaptive Threshold")
-    st.plotly_chart(build_score_chart(results_df, warmup_pts), width="stretch")
+    hdr_c1, hdr_c2 = st.columns([3.0, 1.2])
+    with hdr_c1:
+        st.markdown("#### Anomaly Score vs. Adaptive Threshold")
+    with hdr_c2:
+        show_parts = st.checkbox("Show HST & Z-Score Components", value=False)
+    st.plotly_chart(build_score_chart(results_df, warmup_pts, show_components=show_parts), width="stretch")
 
     st.write("")
-    st.markdown("#### Notable Events (Alarms & Drift Shifts)")
+    ev_c1, ev_c2 = st.columns([3.2, 1.0])
+    with ev_c1:
+        st.markdown("#### Notable Events (Alarms & Drift Shifts)")
+    with ev_c2:
+        st.download_button(
+            "⬇ Export Telemetry CSV",
+            data=results_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"telemetry_results_{selected_scenario.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
     ev_df = results_df.loc[
         results_df["alarm"] | results_df["drift"],
         ["step", "timestamp", "value", "label", "score", "threshold", "alarm", "drift"],
@@ -801,7 +979,7 @@ with tab_details:
         ev_df["Event"] = np.where(
             ev_df["alarm"] & (ev_df["label"] == 1),
             "True Fault Caught",
-            np.where(ev_df["drift"], "ADWIN Drift Adapted", "False Alarm"),
+            np.where(ev_df["drift"], "Drift Adapted", "False Alarm"),
         )
         st.dataframe(
             ev_df[["step", "timestamp", "Event", "value", "score", "threshold"]],
