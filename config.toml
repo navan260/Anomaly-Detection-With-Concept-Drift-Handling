@@ -41,26 +41,30 @@ min_values_for_z    = 5      # readings needed before the z-term is used
 # Adaptive threshold   thr = mean(scores) + k_sigma * std(scores)
 # -----------------------------------------------------------------------------
 [threshold]
-k_sigma             = 3.0    # threshold multiplier (higher = fewer alarms)
-min_threshold       = 0.20   # threshold is clipped to [min, max]
-max_threshold       = 0.88
-init_score_std_floor = 0.015 # std floor when setting the first threshold
-score_std_floor     = 0.02   # std floor when updating the threshold
-score_window_min    = 50     # score history length = max(this, 2 * hst.window_size)
-value_window_min    = 30     # value history length = max(this, hst.window_size)
-baseline_ema_alpha  = 0.10   # how fast the baseline mean tracks normal readings
-baseline_std_floor  = 0.015
-post_drift_min_scores = 8    # min recent scores used to re-set threshold after drift
+k_sigma               = 3.0    # threshold multiplier (higher = fewer alarms)
+min_threshold         = 0.20   # threshold is clipped to [min, max]
+max_threshold         = 0.88
+init_score_std_floor  = 0.015  # std floor when setting the first threshold
+score_std_floor       = 0.02   # std floor when updating the threshold
+score_window_min      = 50     # score history length = max(this, 2 * hst.window_size)
+value_window_min      = 30     # value history length = max(this, hst.window_size)
+baseline_ema_alpha    = 0.05   # EMA smoothing weight for baseline tracking
+baseline_std_floor    = 0.015
+post_drift_min_scores = 8      # min recent scores used to re-set threshold after drift
+streak_limit          = 5      # consecutive alarms before flushing buffered shift to drift monitor
 
 
 # -----------------------------------------------------------------------------
-# ADWIN drift detector
+# Drift detector (ADWIN / Page-Hinkley / KSWIN)
 # -----------------------------------------------------------------------------
 [adwin]
+method      = "adwin" # "adwin" | "page_hinkley" | "kswin" | "none"
 delta       = 0.002   # confidence; smaller = stricter (fewer drift detections)
-min_window  = 10      # readings before ADWIN starts testing (also >= warmup/2)
+min_window  = 10      # readings before drift detector starts testing
 max_window  = 400     # maximum readings kept in the adaptive window
 adaptive    = true    # false = never adapt (ablation: plain HST)
+ph_lambda   = 25.0    # Page-Hinkley cumulative deviation threshold (in standardized units)
+kswin_stat  = 30      # KSWIN recent test sub-window size
 
 
 # -----------------------------------------------------------------------------
